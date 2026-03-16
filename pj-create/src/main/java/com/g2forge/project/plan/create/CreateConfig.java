@@ -16,10 +16,12 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.Getter;
 import lombok.Singular;
+import lombok.extern.jackson.Jacksonized;
 
 @Data
-@Builder
+@Builder(toBuilder = true)
 @AllArgsConstructor
+@Jacksonized
 public class CreateConfig implements ICreateConfig {
 	protected final String project;
 
@@ -30,6 +32,8 @@ public class CreateConfig implements ICreateConfig {
 	protected final String securityLevel;
 
 	protected final String assignee;
+
+	protected final SprintConfig sprintConfig;
 
 	@Singular
 	protected final Set<String> components;
@@ -45,6 +49,8 @@ public class CreateConfig implements ICreateConfig {
 
 	@Singular
 	protected final Map<String, Boolean> flags;
+	
+	protected final String transition;
 
 	@Getter(lazy = true)
 	@JsonIgnore
@@ -55,18 +61,23 @@ public class CreateConfig implements ICreateConfig {
 	private final Set<String> disabledFlags = getSpecifiedFlags().entrySet().stream().filter(entry -> !entry.getValue()).map(Map.Entry::getKey).collect(Collectors.toSet());
 
 	@JsonIgnore
+	public List<CreateIssue> getDisabledIssues() {
+		return getIssues().stream().filter(issue -> !issue.isEnabled(this)).collect(Collectors.toList());
+	}
+
+	@JsonIgnore
 	public List<CreateIssue> getEnabledIssues() {
 		return getIssues().stream().filter(issue -> issue.isEnabled(this)).collect(Collectors.toList());
 	}
 
-	@JsonIgnore
-	public List<CreateIssue> getDisabledIssues() {
-		return getIssues().stream().filter(issue -> !issue.isEnabled(this)).collect(Collectors.toList());
+	@Override
+	public Integer getSprint() {
+		return getSprintConfig() == null ? null : sprintConfig.getSprint();
 	}
 
 	public void validateFlags() {
 		final Set<String> referencedFlags = getIssues().stream().flatMap(issue -> issue.getFlags() == null ? Stream.empty() : issue.getFlags().stream()).collect(Collectors.toSet());
 		final Set<String> unknownFlags = HCollection.difference(referencedFlags, getSpecifiedFlags().keySet());
-		if (!unknownFlags.isEmpty()) throw new IllegalArgumentException("The following flags are refenced by issues, but are neither enabled nor disabled: " + unknownFlags.stream().collect(HCollector.joining(", ", ", & ")));
+		if (!unknownFlags.isEmpty()) throw new IllegalArgumentException("The following flags are refenced by issues, but are neither enabled nor disabled: " + unknownFlags.stream().collect(HCollector.joiningHuman()));
 	}
 }

@@ -5,7 +5,6 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
@@ -22,7 +21,7 @@ import com.g2forge.alexandria.command.exit.IExit;
 import com.g2forge.alexandria.command.invocation.CommandInvocation;
 import com.g2forge.alexandria.log.HLog;
 import com.g2forge.gearbox.jira.ExtendedJiraRestClient;
-import com.g2forge.gearbox.jira.JIRAServer;
+import com.g2forge.gearbox.jira.JiraAPI;
 
 import lombok.Builder;
 import lombok.Data;
@@ -52,10 +51,10 @@ public class Download implements IStandardCommand {
 	}
 
 	@Override
-	public IExit invoke(CommandInvocation<InputStream, PrintStream> invocation) throws Throwable {
+	public IExit invoke(CommandInvocation<?, InputStream, PrintStream> invocation) throws Throwable {
 		HLog.getLogControl().setLogLevel(Level.INFO);
 		if (invocation.getArguments().size() != 1) throw new IllegalArgumentException();
-		final Path inputPath = Paths.get(invocation.getArguments().get(0));
+		final Path inputPath = invocation.getArgumentsAsArguments().get(0).getPath();
 		final ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
 		final Input input = mapper.readValue(inputPath.toFile(), Input.class);
 
@@ -67,7 +66,7 @@ public class Download implements IStandardCommand {
 				header.createCell(1).setCellValue("Summary");
 			}
 
-			try (final ExtendedJiraRestClient client = JIRAServer.load().connect(true)) {
+			try (final ExtendedJiraRestClient client = JiraAPI.load().connect(true)) {
 				final int max = 500;
 				int base = 0, rowNum = 1;
 				while (true) {

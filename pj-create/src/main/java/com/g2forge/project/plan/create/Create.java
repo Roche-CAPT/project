@@ -4,42 +4,51 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.net.URISyntaxException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import org.slf4j.event.Level;
 
 import com.atlassian.jira.rest.client.api.IssueRestClient;
 import com.atlassian.jira.rest.client.api.domain.BasicComponent;
 import com.atlassian.jira.rest.client.api.domain.BasicIssue;
+import com.atlassian.jira.rest.client.api.domain.Issue;
 import com.atlassian.jira.rest.client.api.domain.IssueFieldId;
 import com.atlassian.jira.rest.client.api.domain.IssuelinksType;
+import com.atlassian.jira.rest.client.api.domain.Transition;
 import com.atlassian.jira.rest.client.api.domain.input.ComplexIssueInputFieldValue;
 import com.atlassian.jira.rest.client.api.domain.input.FieldInput;
 import com.atlassian.jira.rest.client.api.domain.input.IssueInputBuilder;
 import com.atlassian.jira.rest.client.api.domain.input.LinkIssuesInput;
+import com.atlassian.jira.rest.client.api.domain.input.TransitionInput;
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.JsonMappingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.g2forge.alexandria.command.command.IStandardCommand;
 import com.g2forge.alexandria.command.exit.IExit;
 import com.g2forge.alexandria.command.invocation.CommandInvocation;
 import com.g2forge.alexandria.java.core.error.HError;
+import com.g2forge.alexandria.java.function.ISupplier;
+import com.g2forge.alexandria.java.function.cache.FixedCachingSupplier;
+import com.g2forge.alexandria.java.io.dataaccess.IDataSource;
+import com.g2forge.alexandria.java.io.dataaccess.PathDataSource;
 import com.g2forge.alexandria.log.HLog;
 import com.g2forge.gearbox.jira.ExtendedJiraRestClient;
-import com.g2forge.gearbox.jira.JIRAServer;
+import com.g2forge.gearbox.jira.JiraAPI;
+import com.g2forge.gearbox.jira.fields.KnownField;
+import com.g2forge.project.core.HConfig;
+import com.g2forge.project.core.Server;
+import com.g2forge.project.plan.create.CreateIssue.CreateIssueBuilder;
+import com.google.common.base.Objects;
 
 import io.atlassian.util.concurrent.Promise;
 import lombok.AllArgsConstructor;
@@ -55,7 +64,7 @@ import lombok.Data;
  * The <code>INPUTFILE</code> must be a YAML file, which consists of a configuration one field of which is <code>issues</code>. The configuration must specify
  * at least a <code>summary</code> for each issue, and optionally more. The fields of the issues in the YAML file are documented below. The configuration can
  * also include, at the top level, an entry for any field marked "configurable" whose value will be used for any issue that does not specify a value explicitly.
- * Please see {@link JIRAServer} for information on specifying the Jira server and user account.
+ * Please see {@link JiraAPI} for information on specifying the Jira server and user account.
  * 
  * <table>
  * <caption>Create issues issue properties and their descriptions</caption> <thead>
@@ -156,18 +165,29 @@ public class Create implements IStandardCommand {
 
 	protected static final Pattern PATTERN_KEY = Pattern.compile("([A-Z0-9]{2,5}-[0-9]+)(\\s.*)?");
 
-	protected static Changes computeChanges(CreateConfig config) {
+	protected static Changes computeChanges(Server server, CreateConfig config) {
+		final SprintConfig sprintWithDefault = config.getSprintConfig() == null ? SprintConfig.getDEFAULT() : config.getSprintConfig().fallback(SprintConfig.getDEFAULT());
+		final SprintConfig sprintWithOffset = (server == null) ? sprintWithDefault : sprintWithDefault.toBuilder().offset(server.modifySprint(sprintWithDefault.getOffset())).build();
+
 		final Changes.ChangesBuilder retVal = Changes.builder();
 		final Set<String> disabledSummaries = config.getDisabledIssues().stream().map(CreateIssue::getSummary).collect(Collectors.toSet());
 		for (CreateIssue raw : config.getEnabledIssues()) {
-			// Integrate the configuration into the issue & record it 
-			final CreateIssue issue = raw.fallback(config);
-			retVal.issue(issue);
+			// Integrate the configuration into the issue & record it
+			final CreateIssue issueWithFallback = raw.fallback(config);
+			final CreateIssue issueWithServer;
+			{
+				final CreateIssueBuilder builder = issueWithFallback.toBuilder();
+				builder.sprint(sprintWithOffset.modify(issueWithFallback.getSprint()));
+				if ((server != null) && (server.getUsers() != null)) builder.assignee(server.getUsers().getOrDefault(issueWithFallback.getAssignee(), issueWithFallback.getAssignee()));
+				issueWithServer = builder.build();
+			}
+
+			retVal.issue(issueWithServer);
 
 			// Record all the links
-			for (String relationship : issue.getRelationships().keySet()) {
-				for (String target : issue.getRelationships().get(relationship)) {
-					if (!disabledSummaries.contains(target)) retVal.link(new LinkIssuesInput(issue.getSummary(), target, relationship, null));
+			for (String relationship : issueWithServer.getRelationships().keySet()) {
+				for (String target : issueWithServer.getRelationships().get(relationship)) {
+					if (!disabledSummaries.contains(target)) retVal.link(new LinkIssuesInput(issueWithServer.getSummary(), target, relationship, null));
 				}
 			}
 		}
@@ -197,16 +217,18 @@ public class Create implements IStandardCommand {
 
 	protected final Map<String, Map<String, BasicComponent>> projectComponentsCache = new LinkedHashMap<>();
 
-	public List<String> createIssues(InputStream stream) throws JsonParseException, JsonMappingException, IOException, URISyntaxException, InterruptedException, ExecutionException {
+	public Map<String, String> createIssues(IDataSource serverDataSource, IDataSource configDataSource) throws JsonParseException, JsonMappingException, IOException, URISyntaxException, InterruptedException, ExecutionException {
 		// Load the config, but if it's empty, don't bother
-		final CreateConfig config = load(stream);
-		if ((config.getIssues() == null) || config.getIssues().isEmpty()) return Collections.emptyList();
+		final CreateConfig config = HConfig.load(configDataSource, CreateConfig.class);
+		if ((config.getIssues() == null) || config.getIssues().isEmpty()) return Collections.emptyMap();
+
+		// Load the server if one is specified;
+		final Server server = (serverDataSource != null) ? HConfig.load(serverDataSource, Server.class) : null;
 
 		config.validateFlags();
-		final Changes changes = computeChanges(config);
+		final Changes changes = computeChanges(server, config);
 		verifyChanges(changes);
-		//return changes.getIssues().stream().map(CreateIssue::getSummary).collect(Collectors.toList());
-		return implementChanges(changes);
+		return implementChanges(server, changes);
 	}
 
 	protected Map<String, BasicComponent> getProjectComponents(final ExtendedJiraRestClient client, final String projectKey) {
@@ -225,16 +247,10 @@ public class Create implements IStandardCommand {
 		});
 	}
 
-	protected List<String> implementChanges(Changes changes) throws IOException, URISyntaxException, InterruptedException, ExecutionException {
+	protected Map<String, String> implementChanges(Server server, Changes changes) throws IOException, URISyntaxException, InterruptedException, ExecutionException {
+		final boolean dryrun = ProjectCreateFlag.DRYRUN.getAccessor().get();
 		HLog.getLogControl().setLogLevel(Level.INFO);
-		try (final ExtendedJiraRestClient client = JIRAServer.load().connect(true)) {
-			final Map<String, LinkType> linkTypes = new HashMap<>();
-			for (IssuelinksType linkType : client.getMetadataClient().getIssueLinkTypes().get()) {
-				linkTypes.put(linkType.getName(), new LinkType(linkType.getName(), false));
-				linkTypes.put(linkType.getInward(), new LinkType(linkType.getName(), true));
-				linkTypes.put(linkType.getOutward(), new LinkType(linkType.getName(), false));
-			}
-
+		try (final ExtendedJiraRestClient client = JiraAPI.createFromPropertyInput(server == null ? null : server.getApi(), null).connect(true)) {
 			final IssueRestClient issueClient = client.getIssueClient();
 			final Map<String, String> issues = new LinkedHashMap<>();
 			for (CreateIssue issue : changes.getIssues()) {
@@ -243,15 +259,16 @@ public class Create implements IStandardCommand {
 
 				if ("Epic".equals(issue.getType())) {
 					// Name epics the same as their summary
-					builder.setFieldInput(new FieldInput("customfield_10002", issue.getSummary()));
+					builder.setFieldInput(KnownField.EpicSummary.get(server).createFieldInput(issue.getSummary()));
 				} else {
-					if (issue.getEpic() != null) builder.setFieldInput(new FieldInput("customfield_10000", issue.getEpic()));
+					if (issue.getEpic() != null) builder.setFieldInput(KnownField.Parent.get(server).createFieldInput(issue.getEpic()));
 				}
 
-				if (issue.getSecurityLevel() != null) builder.setFieldInput(new FieldInput("security", ComplexIssueInputFieldValue.with("name", issue.getSecurityLevel())));
+				if (issue.getSecurityLevel() != null) builder.setFieldInput(KnownField.Security.get(server).createFieldInput(issue.getSecurityLevel()));
 				builder.setSummary(issue.getSummary());
 				builder.setDescription(issue.getDescription());
-				if (issue.getAssignee() != null) builder.setAssigneeName(issue.getAssignee());
+				if (issue.getAssignee() != null) builder.setFieldInput(KnownField.Assignee.get(server).createFieldInput(issue.getAssignee()));
+				if (issue.getSprint() != null) builder.setFieldInput(KnownField.Sprint.get(server).createFieldInput(issue.getSprint()));
 				if ((issue.getComponents() != null) && !issue.getComponents().isEmpty()) {
 					final Map<String, BasicComponent> components = getProjectComponents(client, issue.getProject());
 					builder.setFieldInput(new FieldInput(IssueFieldId.COMPONENTS_FIELD, issue.getComponents().stream().map(name -> {
@@ -262,49 +279,74 @@ public class Create implements IStandardCommand {
 				}
 				if ((issue.getLabels() != null) && !issue.getLabels().isEmpty()) builder.setFieldInput(new FieldInput(IssueFieldId.LABELS_FIELD, issue.getLabels()));
 
-				final List<Throwable> throwables = new ArrayList<>();
-				for (int i = 0; i < 5; i++) {
-					final Promise<BasicIssue> promise = issueClient.createIssue(builder.build());
-					final BasicIssue created;
-					try {
-						created = promise.get();
-					} catch (ExecutionException e) {
-						throwables.add(e);
-						continue;
+				if (dryrun) issues.put(issue.getSummary(), "DRYRUN");
+				else {
+					BasicIssue created = null;
+					{
+						final List<Throwable> throwables = new ArrayList<>();
+						for (int i = 0; i < 5; i++) {
+							final Promise<BasicIssue> promise = issueClient.createIssue(builder.build());
+							try {
+								created = promise.get();
+							} catch (ExecutionException e) {
+								throwables.add(e);
+								continue;
+							}
+							issues.put(issue.getSummary(), created.getKey());
+							throwables.clear();
+							break;
+						}
+						if (!throwables.isEmpty()) HError.withSuppressed(new RuntimeException(String.format("Failed to create issue: %1$s", issue.getSummary())), throwables).printStackTrace(System.err);
 					}
-					issues.put(issue.getSummary(), created.getKey());
-					throwables.clear();
-					break;
-				}
-				if (!throwables.isEmpty()) {
-					HError.withSuppressed(new RuntimeException(String.format("Failed to create issue: %1$s", issue.getSummary())), throwables).printStackTrace(System.err);
+
+					final String transitionName = issue.getTransition();
+					if (transitionName != null) {
+						final List<Throwable> throwables = new ArrayList<>();
+						for (int i = 0; i < 5; i++) {
+							try {
+								final Issue actualIssue = issueClient.getIssue(created.getKey()).get();
+								final Iterable<Transition> transitions = issueClient.getTransitions(actualIssue).get();
+								final Optional<Transition> transition = StreamSupport.stream(transitions.spliterator(), false).filter(t -> Objects.equal(t.getName(), transitionName)).findFirst();
+								if (transition.isEmpty()) throw new IllegalArgumentException(String.format("There was no transition named %1$s in Jira, please check that you're using the name of the transition, rather than the desired end state, and update your issue creation config", transitionName));
+								issueClient.transition(actualIssue, new TransitionInput(transition.get().getId())).get();
+							} catch (ExecutionException e) {
+								throwables.add(e);
+								continue;
+							}
+						}
+						if (!throwables.isEmpty()) HError.withSuppressed(new RuntimeException(String.format("Failed to transition issue: %1$s %2$s", created.getKey(), issue.getSummary())), throwables).printStackTrace(System.err);
+					}
 				}
 			}
 
-			for (LinkIssuesInput link : changes.getLinks()) {
-				final LinkType linkType = linkTypes.get(link.getLinkType());
-				final String from = issues.get(link.getFromIssueKey());
-				final String to = issues.getOrDefault(link.getToIssueKey(), link.getToIssueKey());
-				// TODO: Handle it when an issue we're linking wasn't created
-				issueClient.linkIssue(new LinkIssuesInput(linkType.isReverse() ? to : from, linkType.isReverse() ? from : to, linkType.getName(), link.getComment())).get();
+			if (!dryrun && !changes.getLinks().isEmpty()) {
+				final Map<String, LinkType> linkTypes = new HashMap<>();
+				for (IssuelinksType linkType : client.getMetadataClient().getIssueLinkTypes().get()) {
+					linkTypes.put(linkType.getName(), new LinkType(linkType.getName(), false));
+					linkTypes.put(linkType.getInward(), new LinkType(linkType.getName(), true));
+					linkTypes.put(linkType.getOutward(), new LinkType(linkType.getName(), false));
+				}
+
+				for (LinkIssuesInput link : changes.getLinks()) {
+					final LinkType linkType = linkTypes.get(link.getLinkType());
+					final String from = issues.get(link.getFromIssueKey());
+					final String to = issues.getOrDefault(link.getToIssueKey(), link.getToIssueKey());
+					// TODO: Handle it when an issue we're linking wasn't created
+					issueClient.linkIssue(new LinkIssuesInput(linkType.isReverse() ? to : from, linkType.isReverse() ? from : to, linkType.getName(), link.getComment())).get();
+				}
 			}
 
-			return new ArrayList<>(issues.values());
+			return issues;
 		}
 	}
 
 	@Override
-	public IExit invoke(CommandInvocation<InputStream, PrintStream> invocation) throws Throwable {
-		if (invocation.getArguments().size() != 1) throw new IllegalArgumentException();
-		final Path input = Paths.get(invocation.getArguments().get(0));
-		try (final InputStream stream = Files.newInputStream(input)) {
-			createIssues(stream).forEach(System.out::println);
-		}
+	public IExit invoke(CommandInvocation<?, InputStream, PrintStream> invocation) throws Throwable {
+		if (invocation.getArguments().size() < 1 || invocation.getArguments().size() > 2) throw new IllegalArgumentException("You must specify one or two inputs the optional path to server and the path fo the config!");
+		final boolean hasServer = invocation.getArguments().size() > 1;
+		final IDataSource server = hasServer ? new PathDataSource(invocation.getArgumentsAsArguments().get(0).getPath()) : null;
+		final IDataSource config = new PathDataSource(invocation.getArgumentsAsArguments().get(hasServer ? 1 : 0).getPath());
+		createIssues(server, config).entrySet().forEach(entry -> System.out.println(String.format("%1$s %2$s", entry.getValue(), entry.getKey())));
 		return IStandardCommand.SUCCESS;
-	}
-
-	protected CreateConfig load(final InputStream stream) throws IOException, JsonParseException, JsonMappingException {
-		final ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
-		return mapper.readValue(stream, CreateConfig.class);
 	}
 }

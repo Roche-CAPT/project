@@ -2,7 +2,7 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 
-	<artifactId>pj-plan</artifactId>
+	<artifactId>pj-report</artifactId>
 
 	<parent>
 		<groupId>com.g2forge.project</groupId>
@@ -11,12 +11,8 @@
 		<relativePath>../pj-project/pom.xml</relativePath>
 	</parent>
 
-	<name>Project Plan</name>
-	<description>Commands for project planning</description>
-
-	<properties>
-		<poi.version>5.2.5</poi.version>
-	</properties>
+	<name>Project Report</name>
+	<description>Commands for reporting on projects</description>
 
 	<dependencies>
 		<dependency>
@@ -24,16 +20,25 @@
 			<artifactId>pj-core</artifactId>
 			<version>${project.version}</version>
 		</dependency>
-
 		<dependency>
-			<groupId>org.apache.poi</groupId>
-			<artifactId>poi</artifactId>
-			<version>${poi.version}</version>
+			<groupId>com.g2forge.alexandria</groupId>
+			<artifactId>ax-match</artifactId>
+			<version>${alexandria.version}</version>
 		</dependency>
 		<dependency>
-			<groupId>org.apache.poi</groupId>
-			<artifactId>poi-ooxml</artifactId>
-			<version>${poi.version}</version>
+			<groupId>com.g2forge.gearbox</groupId>
+			<artifactId>gb-serdes</artifactId>
+			<version>${gearbox.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.fasterxml.jackson.dataformat</groupId>
+			<artifactId>jackson-dataformat-csv</artifactId>
+			<version>${jackson.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.g2forge.alexandria</groupId>
+			<artifactId>ax-parse</artifactId>
+			<version>${alexandria.version}</version>
 		</dependency>
 	</dependencies>
 </project>
